@@ -188,6 +188,14 @@ async def post_download(body: DownloadRequest) -> DownloadResponse:
     Returns **202 Accepted** immediately; the actual work is performed
     asynchronously by an RQ worker process.
     """
+    from rq.job import Retry  # noqa: PLC0415
+    from workers.tasks import (  # noqa: PLC0415
+        on_failure_callback,
+        on_success_callback,
+        MAX_RETRIES,
+        RETRY_INTERVALS,
+    )
+
     job_id = str(uuid.uuid4())
 
     q   = _get_queue()
@@ -198,9 +206,14 @@ async def post_download(body: DownloadRequest) -> DownloadResponse:
         job_timeout="10m",
         result_ttl=3_600,       # keep result in Redis for 1 hour
         failure_ttl=86_400,     # keep failure info for 24 hours
+        # Retry transient failures up to MAX_RETRIES times.
+        # on_failure_callback will zero retries_left for NonRetryableErrors.
+        retry=Retry(max=MAX_RETRIES, interval=RETRY_INTERVALS),
+        on_failure=on_failure_callback,
+        on_success=on_success_callback,
     )
 
-    logger.info("Enqueued job %s for %s", job.id, body.url)
+    logger.info("Enqueued job %s for %s (retries=%d)", job.id, body.url, MAX_RETRIES)
     return DownloadResponse(job_id=job.id, status="queued")
 
 

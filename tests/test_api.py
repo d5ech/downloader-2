@@ -37,6 +37,7 @@ for _mod in ("redis", "rq", "rq.job", "rq.exceptions"):
 # Provide the minimal symbols that api.py uses at import time
 sys.modules["rq"].Queue = MagicMock                          # type: ignore[attr-defined]
 sys.modules["rq.job"].Job = MagicMock                        # type: ignore[attr-defined]
+sys.modules["rq.job"].Retry = MagicMock                      # type: ignore[attr-defined]
 
 # NoSuchJobError used in _fetch_job
 class _NoSuchJobError(Exception):
