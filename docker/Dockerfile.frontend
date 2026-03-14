@@ -4,26 +4,37 @@
 FROM node:20-alpine AS deps
 
 WORKDIR /app
-COPY frontend/package.json frontend/package-lock.json* ./
-RUN npm ci
+COPY frontend/package.json ./
+# Use npm install (not npm ci) — no lock file required in repo.
+RUN npm install
 
 # ============================================================
-# Stage 2 — Build Next.js app
+# Stage 2 — Development (hot-reload via volume mount)
+# Used by docker-compose.yml: target: dev
+# Source is mounted at runtime; node_modules stay in the image.
+# ============================================================
+FROM deps AS dev
+
+EXPOSE 3000
+CMD ["npm", "run", "dev"]
+
+# ============================================================
+# Stage 3 — Production build
 # ============================================================
 FROM deps AS builder
 
-WORKDIR /app
 COPY frontend/ .
 RUN npm run build
 
 # ============================================================
-# Stage 3 — Production runtime
+# Stage 4 — Production runtime (standalone)
 # ============================================================
 FROM node:20-alpine AS runner
 
 ENV NODE_ENV=production
 
 WORKDIR /app
+
 COPY --from=builder /app/public ./public
 COPY --from=builder /app/.next/standalone ./
 COPY --from=builder /app/.next/static ./.next/static

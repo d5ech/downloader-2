@@ -1,0 +1,118 @@
+x-backend-env: &backend-env
+  REDIS_URL: redis://redis:6379/0
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+services:
+
+  # ------------------------------------------------------------
+  # Redis — job queue and result backend
+  # ------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ------------------------------------------------------------
+  # FastAPI — REST API
+  # ------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: api
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      <<: *backend-env
+    ports:
+      - "8000:8000"
+    volumes:
+      - jobs_data:/tmp/jobs
+      - ./backend:/app/backend
+      - ./workers:/app/workers
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ------------------------------------------------------------
+  # RQ Worker — background job processor
+  # ------------------------------------------------------------
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: worker
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      <<: *backend-env
+      RQ_QUEUES: ${RQ_QUEUES:-high,default,low}
+      RQ_BURST: ${RQ_BURST:-false}
+    volumes:
+      - jobs_data:/tmp/jobs
+      - ./backend:/app/backend
+      - ./workers:/app/workers
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # ------------------------------------------------------------
+  # Next.js Frontend
+  # ------------------------------------------------------------
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.frontend
+      target: dev
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      NEXT_PUBLIC_API_URL: http://api:8000
+      WATCHPACK_POLLING: "true"
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend/src:/app/src
+      - ./frontend/public:/app/public
+    depends_on:
+      api:
+        condition: service_healthy
+
+  # ------------------------------------------------------------
+  # RQ Dashboard — optional monitoring UI
+  # ------------------------------------------------------------
+  rq-dashboard:
+    image: eoranged/rq-dashboard:latest
+    restart: unless-stopped
+    ports:
+      - "9181:9181"
+    environment:
+      RQ_DASHBOARD_REDIS_URL: redis://redis:6379/0
+    depends_on:
+      - redis
+    profiles:
+      - dev
+
+volumes:
+  redis_data:
+  jobs_data:
