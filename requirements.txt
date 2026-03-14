@@ -1,0 +1,22 @@
+# ──────────────────────────────────────────────
+# Facebook Ad Library Downloader — Python deps
+# Python 3.11
+# ──────────────────────────────────────────────
+
+# Web framework
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+pydantic==2.7.3
+
+# Browser automation
+playwright==1.44.0
+
+# HTTP client
+requests==2.32.3
+
+# Queue & Redis
+redis==5.0.6
+rq==1.16.2
+
+# Utilities
+python-dotenv==1.0.1
