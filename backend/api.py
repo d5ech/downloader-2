@@ -1,177 +1,266 @@
 """
-FastAPI backend — Facebook Ad Library Creative Downloader
-Exposes REST endpoints for job submission, status polling, and media retrieval.
+api.py — FastAPI server for the Facebook Ad Library Creative Downloader.
+
+Endpoints
+---------
+POST   /download            Enqueue a scrape + download job
+GET    /status/{job_id}     Poll job status
+GET    /result/{job_id}     Retrieve downloaded filenames when complete
+
+GET    /health              Liveness probe
 """
 
 from __future__ import annotations
 
 import uuid
+from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, HttpUrl
-import redis
-from rq import Queue
+from pydantic import BaseModel, field_validator
 
-from utils import get_redis_connection, get_logger
-from downloader import download_media_assets
-from scraper import scrape_ad_library_url
+try:
+    from backend.utils import get_redis_connection, get_logger, AdUrlError, parse_ad_url
+except ImportError:
+    from utils import get_redis_connection, get_logger, AdUrlError, parse_ad_url  # type: ignore[no-redef]
 
 logger = get_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# Application
+# ---------------------------------------------------------------------------
 
 app = FastAPI(
     title="Facebook Ad Library Downloader",
     description="Submit Ad Library URLs and download creative assets.",
-    version="0.1.0",
+    version="1.0.0",
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Tighten in production
+    allow_origins=["*"],   # tighten in production via env config
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ---------------------------------------------------------------------------
-# Schemas
+# RQ status → API status mapping
+#
+#   RQ statuses  : queued | started | finished | failed | deferred | stopped
+#   API statuses : queued | running | complete | error
+# ---------------------------------------------------------------------------
+
+_RQ_TO_API_STATUS: dict[str, str] = {
+    "queued":   "queued",
+    "deferred": "queued",   # waiting on a dependency
+    "started":  "running",
+    "finished": "complete",
+    "failed":   "error",
+    "stopped":  "error",
+    "canceled": "error",
+}
+
+
+def _map_status(rq_status: str) -> str:
+    """Translate an RQ job-status string to the public API vocabulary."""
+    return _RQ_TO_API_STATUS.get(rq_status, "error")
+
+
+# ---------------------------------------------------------------------------
+# Request / response schemas
 # ---------------------------------------------------------------------------
 
 
-class SubmitRequest(BaseModel):
-    url: HttpUrl
-    # Optional filters the user can pass
-    ad_id: str | None = None
-    max_assets: int = 20
+class DownloadRequest(BaseModel):
+    """Body accepted by POST /download."""
+
+    url: str
+
+    @field_validator("url")
+    @classmethod
+    def validate_ad_url(cls, v: str) -> str:
+        """Reject anything that is not a valid Facebook Ad Library URL or bare ID."""
+        try:
+            parsed = parse_ad_url(v)
+            # Normalise to the canonical URL so the worker always receives https://
+            return parsed["url"]
+        except AdUrlError as exc:
+            raise ValueError(str(exc)) from exc
 
 
-class JobResponse(BaseModel):
+class DownloadResponse(BaseModel):
+    """Response body for POST /download."""
+
+    job_id: str
+    status: str   # always "queued" on success
+
+
+class StatusResponse(BaseModel):
+    """Response body for GET /status/{job_id}."""
+
+    job_id: str
+    status: str   # queued | running | complete | error
+
+
+class ResultResponse(BaseModel):
+    """Response body for GET /result/{job_id}."""
+
     job_id: str
     status: str
-    message: str
-
-
-class JobStatusResponse(BaseModel):
-    job_id: str
-    status: str          # queued | started | finished | failed
-    result: Any | None = None
-    error: str | None = None
+    files: list[str]
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Internal helpers
 # ---------------------------------------------------------------------------
 
 
-def _get_queue() -> Queue:
-    """Return the default RQ queue backed by Redis."""
-    conn = get_redis_connection()
-    return Queue(connection=conn)
+def _get_queue():
+    """Return the default RQ Queue backed by Redis."""
+    from rq import Queue
+    return Queue(connection=get_redis_connection())
 
 
-def _get_job(job_id: str):
-    """Fetch an RQ Job object; raises 404 if not found."""
+def _fetch_job(job_id: str):
+    """
+    Fetch an RQ Job by ID.
+
+    Raises:
+        HTTPException(404): if the job does not exist in Redis.
+    """
     from rq.job import Job
-    conn = get_redis_connection()
+    from rq.exceptions import NoSuchJobError
+
     try:
-        return Job.fetch(job_id, connection=conn)
-    except Exception:
-        raise HTTPException(status_code=404, detail=f"Job {job_id!r} not found.")
+        return Job.fetch(job_id, connection=get_redis_connection())
+    except (NoSuchJobError, Exception) as exc:
+        # rq raises NoSuchJobError; older versions raise a plain Exception
+        if "NoSuchJob" in type(exc).__name__ or "does not exist" in str(exc).lower():
+            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+
+
+def _files_from_result(job_result: dict | None) -> list[str]:
+    """
+    Extract the list of successfully downloaded filenames from a job result dict.
+
+    Only files whose ``success`` flag is truthy are included.  Returns an
+    empty list when *job_result* is ``None`` or contains no assets.
+    """
+    if not job_result or not isinstance(job_result, dict):
+        return []
+    return [
+        asset["filename"]
+        for asset in job_result.get("assets", [])
+        if asset.get("success") and asset.get("filename")
+    ]
 
 
 # ---------------------------------------------------------------------------
-# Endpoints
+# Routes
 # ---------------------------------------------------------------------------
 
 
 @app.get("/health", tags=["meta"])
 async def health_check() -> dict:
-    """Liveness probe."""
+    """Liveness probe — returns 200 when the API process is alive."""
     return {"status": "ok"}
 
 
-@app.post("/jobs", response_model=JobResponse, tags=["jobs"])
-async def submit_job(payload: SubmitRequest) -> JobResponse:
+@app.post(
+    "/download",
+    response_model=DownloadResponse,
+    status_code=202,
+    tags=["jobs"],
+    summary="Enqueue a scrape + download job",
+)
+async def post_download(body: DownloadRequest) -> DownloadResponse:
     """
-    Accept a Facebook Ad Library URL and enqueue a scrape + download job.
+    Accept a Facebook Ad Library URL, enqueue a background job, and
+    return a ``job_id`` that the client can poll.
 
-    The heavy lifting is delegated to the RQ worker pool so this endpoint
-    returns immediately with a job ID that the client can poll.
+    The URL is validated and normalised to its canonical form before
+    being forwarded to the worker.
+
+    Returns **202 Accepted** immediately; the actual work is performed
+    asynchronously by an RQ worker process.
     """
-    q = _get_queue()
+    job_id = str(uuid.uuid4())
+
+    q   = _get_queue()
     job = q.enqueue(
-        "workers.tasks.run_ad_download",   # dotted path resolved by the worker
-        kwargs={
-            "url": str(payload.url),
-            "ad_id": payload.ad_id,
-            "max_assets": payload.max_assets,
-        },
-        job_id=str(uuid.uuid4()),
+        "workers.tasks.run_ad_download",
+        kwargs={"url": body.url, "job_id": job_id},
+        job_id=job_id,
         job_timeout="10m",
-        result_ttl=3600,
-    )
-    logger.info("Enqueued job %s for URL %s", job.id, payload.url)
-    return JobResponse(job_id=job.id, status="queued", message="Job enqueued successfully.")
-
-
-@app.get("/jobs/{job_id}", response_model=JobStatusResponse, tags=["jobs"])
-async def get_job_status(job_id: str) -> JobStatusResponse:
-    """Poll the status of an existing download job."""
-    job = _get_job(job_id)
-    return JobStatusResponse(
-        job_id=job.id,
-        status=job.get_status().value,
-        result=job.result if job.is_finished else None,
-        error=str(job.exc_info) if job.is_failed else None,
+        result_ttl=3_600,       # keep result in Redis for 1 hour
+        failure_ttl=86_400,     # keep failure info for 24 hours
     )
 
+    logger.info("Enqueued job %s for %s", job.id, body.url)
+    return DownloadResponse(job_id=job.id, status="queued")
 
-@app.get("/jobs/{job_id}/assets", tags=["jobs"])
-async def list_job_assets(job_id: str) -> dict:
+
+@app.get(
+    "/status/{job_id}",
+    response_model=StatusResponse,
+    tags=["jobs"],
+    summary="Poll job status",
+)
+async def get_status(job_id: str) -> StatusResponse:
     """
-    Return metadata (filenames, types, sizes) for all assets downloaded
-    as part of *job_id*.
+    Return the current status of a job.
+
+    Status values
+    -------------
+    * ``queued``   — waiting in the queue (includes RQ's *deferred* state)
+    * ``running``  — a worker is actively processing the job
+    * ``complete`` — finished successfully; results are available
+    * ``error``    — failed, stopped, or cancelled
+
+    Raises **404** if *job_id* is unknown.
     """
-    job = _get_job(job_id)
-    if not job.is_finished:
-        raise HTTPException(status_code=202, detail="Job not finished yet.")
+    job        = _fetch_job(job_id)
+    rq_status  = job.get_status()
+    api_status = _map_status(rq_status.value if hasattr(rq_status, "value") else str(rq_status))
 
-    assets: list[dict] = job.result.get("assets", []) if job.result else []
-    return {"job_id": job_id, "count": len(assets), "assets": assets}
+    return StatusResponse(job_id=job_id, status=api_status)
 
 
-@app.get("/jobs/{job_id}/assets/{filename}", tags=["jobs"])
-async def download_asset(job_id: str, filename: str) -> FileResponse:
+@app.get(
+    "/result/{job_id}",
+    response_model=ResultResponse,
+    tags=["jobs"],
+    summary="Retrieve downloaded filenames",
+)
+async def get_result(job_id: str) -> ResultResponse:
     """
-    Stream a single downloaded asset back to the caller.
-    The file must already exist on the server from a completed job.
+    Return the list of filenames produced by a completed job.
+
+    Raises
+    ------
+    404 : Job not found.
+    202 : Job is still queued or running (retry later).
+    500 : Job finished in an error state.
     """
-    import os
-    from pathlib import Path
+    job        = _fetch_job(job_id)
+    rq_status  = job.get_status()
+    status_str = rq_status.value if hasattr(rq_status, "value") else str(rq_status)
+    api_status = _map_status(status_str)
 
-    job = _get_job(job_id)
-    if not job.is_finished:
-        raise HTTPException(status_code=202, detail="Job not finished yet.")
+    if api_status in ("queued", "running"):
+        raise HTTPException(
+            status_code=202,
+            detail=f"Job is {api_status}. Retry after a moment.",
+        )
 
-    asset_dir = Path("media") / "downloads" / job_id
-    file_path = (asset_dir / filename).resolve()
+    if api_status == "error":
+        error_detail = str(job.exc_info).strip() if job.exc_info else "Job failed."
+        raise HTTPException(status_code=500, detail=error_detail)
 
-    # Guard against path traversal
-    if not str(file_path).startswith(str(asset_dir.resolve())):
-        raise HTTPException(status_code=400, detail="Invalid filename.")
-
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="Asset not found.")
-
-    return FileResponse(path=str(file_path), filename=filename)
-
-
-@app.delete("/jobs/{job_id}", tags=["jobs"])
-async def cancel_job(job_id: str) -> dict:
-    """Cancel a queued or started job."""
-    job = _get_job(job_id)
-    job.cancel()
-    logger.info("Cancelled job %s", job_id)
-    return {"job_id": job_id, "status": "cancelled"}
+    # api_status == "complete"
+    files = _files_from_result(job.result)
+    return ResultResponse(job_id=job_id, status=api_status, files=files)
