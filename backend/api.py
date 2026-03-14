@@ -164,6 +164,30 @@ def _files_from_result(job_result: dict | None) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+@app.get(
+    "/files/{job_id}/{filename}",
+    tags=["jobs"],
+    summary="Download a file produced by a completed job",
+)
+async def get_file(job_id: str, filename: str) -> FileResponse:
+    """
+    Serve a single file from the job output directory.
+
+    Files are stored at ``/tmp/jobs/{job_id}/{filename}`` by the worker.
+
+    Raises **404** if the job directory or file does not exist.
+    """
+    # Prevent path traversal: reject filenames containing separators or leading dot
+    if "/" in filename or "\\" in filename or filename.startswith("."):
+        raise HTTPException(status_code=400, detail="Invalid filename.")
+
+    path = Path(f"/tmp/jobs/{job_id}/{filename}")
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="File not found.")
+
+    return FileResponse(path, filename=filename)
+
+
 @app.get("/health", tags=["meta"])
 async def health_check() -> dict:
     """Liveness probe — returns 200 when the API process is alive."""

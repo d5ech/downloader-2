@@ -10,7 +10,6 @@ interface Props {
 
 export default function SubmitForm({ onJobCreated }: Props) {
   const [url, setUrl] = useState("");
-  const [maxAssets, setMaxAssets] = useState(20);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -20,12 +19,15 @@ export default function SubmitForm({ onJobCreated }: Props) {
     setLoading(true);
 
     try {
-      const job = await submitJob(url.trim(), maxAssets);
+      const job = await submitJob(url.trim());
       onJobCreated(job.job_id);
+      setUrl("");
     } catch (err: unknown) {
-      const message =
-        err instanceof Error ? err.message : "Failed to submit job.";
-      setError(message);
+      // FastAPI validation errors surface in `detail`
+      const detail =
+        (err as { response?: { data?: { detail?: string } } })?.response?.data
+          ?.detail;
+      setError(detail ?? "Failed to submit. Check the URL and try again.");
     } finally {
       setLoading(false);
     }
@@ -33,52 +35,27 @@ export default function SubmitForm({ onJobCreated }: Props) {
 
   return (
     <section className="bg-white rounded-xl shadow p-6">
-      <h2 className="text-lg font-semibold mb-4">Submit Ad Library URL</h2>
       <form onSubmit={handleSubmit} className="space-y-4">
-        {/* URL input */}
         <div>
           <label
             htmlFor="ad-url"
             className="block text-sm font-medium text-gray-700 mb-1"
           >
-            Facebook Ad Library URL
+            Ad Library URL or ID
           </label>
           <input
             id="ad-url"
-            type="url"
+            type="text"
             required
             value={url}
             onChange={(e) => setUrl(e.target.value)}
-            placeholder="https://www.facebook.com/ads/library/?..."
+            placeholder="https://www.facebook.com/ads/library/?id=… or 1234567890"
             className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
           />
         </div>
 
-        {/* Max assets */}
-        <div className="flex items-center gap-3">
-          <label
-            htmlFor="max-assets"
-            className="text-sm font-medium text-gray-700 whitespace-nowrap"
-          >
-            Max assets
-          </label>
-          <input
-            id="max-assets"
-            type="number"
-            min={1}
-            max={100}
-            value={maxAssets}
-            onChange={(e) => setMaxAssets(Number(e.target.value))}
-            className="w-20 border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-          />
-        </div>
+        {error && <p className="text-sm text-red-600">{error}</p>}
 
-        {/* Error */}
-        {error && (
-          <p className="text-red-600 text-sm">{error}</p>
-        )}
-
-        {/* Submit */}
         <button
           type="submit"
           disabled={loading}
@@ -89,7 +66,7 @@ export default function SubmitForm({ onJobCreated }: Props) {
           ) : (
             <Download className="w-4 h-4" />
           )}
-          {loading ? "Submitting…" : "Download Assets"}
+          {loading ? "Submitting…" : "Download"}
         </button>
       </form>
     </section>

@@ -1,17 +1,19 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { getJobStatus, JobStatusResponse } from "@/lib/api";
+import { useEffect, useRef, useState } from "react";
+import { getJobStatus, getJobResult, JobStatus as Status } from "@/lib/api";
 import { Loader2, CheckCircle, XCircle, Clock } from "lucide-react";
 
 interface Props {
   jobId: string;
+  /** Called whenever the status changes. On "complete", files are also passed. */
+  onStatusChange: (status: Status, files?: string[]) => void;
 }
 
-const POLL_INTERVAL_MS = 3000;
+const POLL_MS = 3_000;
 
-const statusConfig: Record<
-  string,
+const STATUS_CFG: Record<
+  Status,
   { label: string; color: string; icon: React.ReactNode }
 > = {
   queued: {
@@ -19,25 +21,28 @@ const statusConfig: Record<
     color: "text-yellow-600 bg-yellow-50 border-yellow-200",
     icon: <Clock className="w-4 h-4" />,
   },
-  started: {
-    label: "In Progress",
+  running: {
+    label: "Processing…",
     color: "text-blue-600 bg-blue-50 border-blue-200",
     icon: <Loader2 className="w-4 h-4 animate-spin" />,
   },
-  finished: {
-    label: "Finished",
+  complete: {
+    label: "Complete",
     color: "text-green-600 bg-green-50 border-green-200",
     icon: <CheckCircle className="w-4 h-4" />,
   },
-  failed: {
+  error: {
     label: "Failed",
     color: "text-red-600 bg-red-50 border-red-200",
     icon: <XCircle className="w-4 h-4" />,
   },
 };
 
-export default function JobStatus({ jobId }: Props) {
-  const [status, setStatus] = useState<JobStatusResponse | null>(null);
+export default function JobStatus({ jobId, onStatusChange }: Props) {
+  const [status, setStatus] = useState<Status>("queued");
+  // Keep a ref so the polling closure always sees the latest callback
+  const callbackRef = useRef(onStatusChange);
+  callbackRef.current = onStatusChange;
 
   useEffect(() => {
     let active = true;
@@ -46,51 +51,50 @@ export default function JobStatus({ jobId }: Props) {
       try {
         const data = await getJobStatus(jobId);
         if (!active) return;
-        setStatus(data);
-        if (data.status !== "finished" && data.status !== "failed") {
-          setTimeout(poll, POLL_INTERVAL_MS);
+
+        setStatus(data.status);
+
+        if (data.status === "complete") {
+          // Fetch the file list and forward it to the parent
+          try {
+            const result = await getJobResult(jobId);
+            if (active) callbackRef.current("complete", result.files);
+          } catch {
+            if (active) callbackRef.current("complete", []);
+          }
+          return; // stop polling
+        }
+
+        callbackRef.current(data.status);
+
+        if (data.status !== "error") {
+          setTimeout(poll, POLL_MS);
         }
       } catch {
-        if (active) setTimeout(poll, POLL_INTERVAL_MS * 2);
+        // Network hiccup — back off and retry
+        if (active) setTimeout(poll, POLL_MS * 2);
       }
     }
 
     poll();
-    return () => { active = false; };
+    return () => {
+      active = false;
+    };
   }, [jobId]);
 
-  if (!status) {
-    return (
-      <div className="flex items-center gap-2 text-sm text-gray-500">
-        <Loader2 className="w-4 h-4 animate-spin" />
-        Fetching job status…
-      </div>
-    );
-  }
-
-  const cfg = statusConfig[status.status] ?? statusConfig.queued;
+  const cfg = STATUS_CFG[status];
 
   return (
-    <section className="bg-white rounded-xl shadow p-6">
-      <h2 className="text-lg font-semibold mb-3">Job Status</h2>
-
-      <div
-        className={`inline-flex items-center gap-2 text-sm font-medium border rounded-full px-3 py-1 ${cfg.color}`}
-      >
-        {cfg.icon}
-        {cfg.label}
+    <section className="bg-white rounded-xl shadow p-4">
+      <div className="flex items-center gap-3">
+        <span
+          className={`inline-flex items-center gap-2 text-sm font-medium border rounded-full px-3 py-1 ${cfg.color}`}
+        >
+          {cfg.icon}
+          {cfg.label}
+        </span>
+        <span className="text-xs font-mono text-gray-400 truncate">{jobId}</span>
       </div>
-
-      <dl className="mt-4 text-sm text-gray-600 space-y-1">
-        <div className="flex gap-2">
-          <dt className="font-medium w-20">Job ID</dt>
-          <dd className="font-mono text-xs text-gray-500 break-all">{status.job_id}</dd>
-        </div>
-      </dl>
-
-      {status.error && (
-        <p className="mt-3 text-red-600 text-sm">{status.error}</p>
-      )}
     </section>
   );
 }

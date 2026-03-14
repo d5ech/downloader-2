@@ -1,8 +1,13 @@
 /**
- * api.ts — Thin wrapper around the FastAPI backend.
+ * api.ts — Typed wrapper around the FastAPI backend.
  *
- * All requests are sent to /api/* which Next.js rewrites to the FastAPI server
- * (see next.config.js).
+ * Requests go to /api/* which next.config.js proxies to the FastAPI server.
+ *
+ * Backend endpoints used:
+ *   POST /download          → { job_id, status: "queued" }
+ *   GET  /status/{job_id}   → { job_id, status: "queued"|"running"|"complete"|"error" }
+ *   GET  /result/{job_id}   → { job_id, status, files: string[] }
+ *   GET  /files/{job_id}/{filename}  → file download
  */
 
 import axios from "axios";
@@ -16,62 +21,50 @@ const client = axios.create({
 // Types
 // ---------------------------------------------------------------------------
 
-export interface JobResponse {
+export type JobStatus = "queued" | "running" | "complete" | "error";
+
+export interface DownloadResponse {
   job_id: string;
   status: string;
-  message: string;
 }
 
-export interface JobStatusResponse {
+export interface StatusResponse {
   job_id: string;
-  status: "queued" | "started" | "finished" | "failed";
-  result: unknown | null;
-  error: string | null;
+  status: JobStatus;
 }
 
-export interface AssetMeta {
-  ad_id: string;
-  filename: string;
-  asset_type: string;
-  size_bytes: number;
-  url: string;
-}
-
-export interface AssetsResponse {
+export interface ResultResponse {
   job_id: string;
-  count: number;
-  assets: AssetMeta[];
+  status: string;
+  files: string[];
 }
 
 // ---------------------------------------------------------------------------
 // API calls
 // ---------------------------------------------------------------------------
 
-/** Submit a new Ad Library URL for processing. */
-export async function submitJob(
-  url: string,
-  maxAssets = 20
-): Promise<JobResponse> {
-  const { data } = await client.post<JobResponse>("/jobs", {
-    url,
-    max_assets: maxAssets,
-  });
+/** Enqueue a new download job for the given Ad Library URL or bare ad ID. */
+export async function submitJob(url: string): Promise<DownloadResponse> {
+  const { data } = await client.post<DownloadResponse>("/download", { url });
   return data;
 }
 
-/** Poll the status of an existing job. */
-export async function getJobStatus(jobId: string): Promise<JobStatusResponse> {
-  const { data } = await client.get<JobStatusResponse>(`/jobs/${jobId}`);
+/** Poll the current status of a job. */
+export async function getJobStatus(jobId: string): Promise<StatusResponse> {
+  const { data } = await client.get<StatusResponse>(`/status/${jobId}`);
   return data;
 }
 
-/** Retrieve asset metadata for a finished job. */
-export async function listAssets(jobId: string): Promise<AssetsResponse> {
-  const { data } = await client.get<AssetsResponse>(`/jobs/${jobId}/assets`);
+/**
+ * Retrieve the list of downloaded filenames for a completed job.
+ * Throws with status 202 if the job is still running.
+ */
+export async function getJobResult(jobId: string): Promise<ResultResponse> {
+  const { data } = await client.get<ResultResponse>(`/result/${jobId}`);
   return data;
 }
 
-/** Build the direct download URL for a single asset. */
-export function assetDownloadUrl(jobId: string, filename: string): string {
-  return `/api/jobs/${jobId}/assets/${encodeURIComponent(filename)}`;
+/** Direct download URL for a single file produced by a job. */
+export function fileDownloadUrl(jobId: string, filename: string): string {
+  return `/api/files/${jobId}/${encodeURIComponent(filename)}`;
 }
