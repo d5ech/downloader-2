@@ -17,8 +17,6 @@ Production features
 * Structured errors — all error responses share a single JSON schema.
 """
 
-from __future__ import annotations
-
 import asyncio
 import contextlib
 import shutil
