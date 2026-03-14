@@ -95,6 +95,12 @@ export default function JobStatus({ jobId, onStatusChange }: Props) {
         </span>
         <span className="text-xs font-mono text-gray-400 truncate">{jobId}</span>
       </div>
+      {status === "error" && (
+        <p className="mt-2 text-xs text-red-500">
+          Processing failed. The ad may have been removed, made private, or the
+          URL is no longer valid. Please check the link and try again.
+        </p>
+      )}
     </section>
   );
 }

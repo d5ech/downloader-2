@@ -49,7 +49,15 @@ PLAYBACK_TIMEOUT_MS = 3_000    # wait for lazy-loaded video URLs after click
 
 # Keys whose *values* are treated as media URLs.
 # The search is case-sensitive to match Facebook's exact field names.
-_VIDEO_KEYS     = {"video_hd_url", "video_sd_url", "playable_url", "playable_url_quality_hd"}
+_VIDEO_KEYS = {
+    "video_hd_url",
+    "video_sd_url",
+    "playable_url",
+    "playable_url_quality_hd",
+    "dash_manifest_url",      # DASH stream manifest (also contains video)
+    "browser_native_hd_url",  # alternate HD key seen in newer responses
+    "browser_native_sd_url",
+}
 _IMAGE_KEYS     = {"image_url", "original_image_url", "resized_image_url"}
 _THUMBNAIL_KEYS = {"thumbnail_url", "thumbnail_image_url"}
 
@@ -181,8 +189,8 @@ def _launch_browser(pw) -> Browser:
 
 
 def _create_context(browser: Browser) -> BrowserContext:
-    """Return a browser context with a realistic user-agent and viewport."""
-    return browser.new_context(
+    """Return a browser context with a realistic user-agent, viewport, and headers."""
+    context = browser.new_context(
         user_agent=(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -190,9 +198,20 @@ def _create_context(browser: Browser) -> BrowserContext:
         ),
         viewport={"width": 1280, "height": 900},
         locale="en-US",
-        # Prevent the page from detecting headless mode via navigator.webdriver
         java_script_enabled=True,
+        extra_http_headers={
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "sec-ch-ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+        },
     )
+    # Hide the navigator.webdriver property so the page cannot detect headless mode
+    context.add_init_script(
+        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+    )
+    return context
 
 
 # ---------------------------------------------------------------------------
@@ -223,12 +242,13 @@ def _collect_media(page: Page, url: str, result: MediaResult) -> None:
 
     page.on("response", _on_response)
 
-    _dismiss_cookie_banner_on_load(page)
-
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
     except Exception as exc:
         logger.warning("Navigation did not complete cleanly (%s) — using partial results", exc)
+
+    # Try to dismiss cookie / consent banner now that the DOM is loaded
+    _dismiss_cookie_banner(page)
 
     # Give the page a moment to fire any in-flight XHRs
     try:
@@ -245,15 +265,32 @@ def _collect_media(page: Page, url: str, result: MediaResult) -> None:
         _trigger_video_playback(page, result, lock)
 
 
-def _dismiss_cookie_banner_on_load(page: Page) -> None:
-    """Register a handler to click the cookie-consent button if it appears."""
-    def _handler(event: Any) -> None:  # noqa: ANN401
-        try:
-            page.click('[data-cookiebanner="accept_button"]', timeout=2_000)
-        except Exception:
-            pass
+def _dismiss_cookie_banner(page: "Page") -> None:
+    """
+    Try to click the cookie / consent accept button if it is visible.
 
-    page.on("domcontentloaded", _handler)
+    Facebook sometimes shows a GDPR consent overlay that blocks interactive
+    elements.  This function tries several known selectors with a short
+    timeout each so the scraper is not significantly slowed when no banner
+    appears.
+
+    Note: this must be called *after* ``page.goto()`` returns, not from a
+    page-event listener, because Playwright's sync API does not support
+    calling ``page.click()`` from inside an event callback.
+    """
+    _COOKIE_SELECTORS = [
+        '[data-cookiebanner="accept_button"]',
+        '[data-testid="cookie-policy-manage-dialog-accept-button"]',
+        'button[title="Accept all"]',
+        '[aria-label="Allow all cookies"]',
+    ]
+    for selector in _COOKIE_SELECTORS:
+        try:
+            page.click(selector, timeout=1_500)
+            logger.debug("Dismissed cookie banner via selector: %s", selector)
+            return
+        except Exception:
+            continue
 
 
 # ---------------------------------------------------------------------------

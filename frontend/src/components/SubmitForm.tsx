@@ -23,10 +23,17 @@ export default function SubmitForm({ onJobCreated }: Props) {
       onJobCreated(job.job_id);
       setUrl("");
     } catch (err: unknown) {
-      // FastAPI validation errors surface in `detail`
+      // The API returns { error, detail } for all error responses.
+      // Prefer the human-readable `detail` string; fall back to the `error`
+      // slug (reformatted) so the user always sees something meaningful.
+      const data = (err as { response?: { data?: Record<string, unknown> } })
+        ?.response?.data;
       const detail =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail;
+        typeof data?.detail === "string" && data.detail
+          ? data.detail
+          : typeof data?.error === "string" && data.error
+          ? data.error.replace(/_/g, " ")
+          : null;
       setError(detail ?? "Failed to submit. Check the URL and try again.");
     } finally {
       setLoading(false);

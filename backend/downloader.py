@@ -201,6 +201,10 @@ def download_assets(
 
             size_bytes = _stream_to_file(response, dest)
 
+            if size_bytes == 0:
+                dest.unlink(missing_ok=True)
+                raise ValueError("Server returned an empty response body (0 bytes)")
+
             records.append({
                 "index":         idx,
                 "asset_type":    asset_type,

@@ -44,10 +44,20 @@ except ImportError:
 logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
-# Rate limiter — Redis-backed so limits are shared across API replicas
+# Rate limiter
+# Redis-backed in production so counters are shared across API replicas.
+# Falls back to in-memory storage if Redis is unavailable (e.g. in tests).
 # ---------------------------------------------------------------------------
 
-limiter = Limiter(key_func=get_remote_address, storage_uri=REDIS_URL)
+try:
+    limiter = Limiter(key_func=get_remote_address, storage_uri=REDIS_URL)
+except Exception as _limiter_exc:  # noqa: BLE001
+    import logging as _logging
+    _logging.getLogger(__name__).warning(
+        "Redis rate-limiter unavailable (%s) — falling back to in-memory storage",
+        _limiter_exc,
+    )
+    limiter = Limiter(key_func=get_remote_address)
 
 # ---------------------------------------------------------------------------
 # Temporary job storage cleanup

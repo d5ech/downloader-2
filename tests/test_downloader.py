@@ -789,3 +789,85 @@ class TestDownloadMediaAssetsShim:
         monkeypatch.setattr("backend.downloader.download_assets", _capture)
         download_media_assets([], "j")
         assert calls[0] == []
+
+
+# ===========================================================================
+# Zero-byte download protection
+# ===========================================================================
+
+class TestZeroByteDownload:
+    """
+    A server that returns an empty response body (0 bytes) must be treated as
+    a download failure, not a success.  Empty files are useless and should not
+    be left on disk.
+    """
+
+    def _patch_get(self, resp):
+        return patch("backend.downloader.requests.Session.get", return_value=resp)
+
+    def test_zero_byte_asset_is_failure(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("backend.downloader.JOBS_ROOT", tmp_path)
+        resp = _make_response(b"", content_type="video/mp4")
+        with self._patch_get(resp):
+            result = download_assets(
+                [{"url": "https://cdn.fb.com/empty.mp4", "asset_type": "video"}], "j"
+            )
+        assert result["assets"][0]["success"] is False
+
+    def test_zero_byte_counted_as_failed(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("backend.downloader.JOBS_ROOT", tmp_path)
+        resp = _make_response(b"", content_type="video/mp4")
+        with self._patch_get(resp):
+            result = download_assets(
+                [{"url": "https://cdn.fb.com/empty.mp4", "asset_type": "video"}], "j"
+            )
+        assert result["summary"]["failed"] == 1
+        assert result["summary"]["succeeded"] == 0
+
+    def test_zero_byte_error_message(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("backend.downloader.JOBS_ROOT", tmp_path)
+        resp = _make_response(b"", content_type="video/mp4")
+        with self._patch_get(resp):
+            result = download_assets(
+                [{"url": "https://cdn.fb.com/empty.mp4", "asset_type": "video"}], "j"
+            )
+        assert result["assets"][0]["error"] is not None
+        assert "0 bytes" in result["assets"][0]["error"]
+
+    def test_zero_byte_file_not_left_on_disk(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("backend.downloader.JOBS_ROOT", tmp_path)
+        resp = _make_response(b"", content_type="video/mp4")
+        with self._patch_get(resp):
+            download_assets(
+                [{"url": "https://cdn.fb.com/empty.mp4", "asset_type": "video"}], "j"
+            )
+        # No .mp4 file should exist in the job directory
+        job_dir = tmp_path / "j"
+        mp4_files = list(job_dir.glob("*.mp4"))
+        assert mp4_files == []
+
+    def test_zero_byte_does_not_stop_other_downloads(self, tmp_path, monkeypatch):
+        """A zero-byte failure should not abort the rest of the batch."""
+        monkeypatch.setattr("backend.downloader.JOBS_ROOT", tmp_path)
+        idx = {"n": 0}
+        responses = [
+            _make_response(b"",      content_type="video/mp4"),   # empty — fails
+            _make_response(b"data",  content_type="video/mp4"),   # good
+        ]
+
+        def _side_effect(*a, **kw):
+            r = responses[idx["n"]]
+            idx["n"] += 1
+            return r
+
+        with patch("backend.downloader.requests.Session.get", side_effect=_side_effect):
+            result = download_assets(
+                [
+                    {"url": "https://cdn.fb.com/empty.mp4", "asset_type": "video"},
+                    {"url": "https://cdn.fb.com/good.mp4",  "asset_type": "video"},
+                ],
+                "j",
+            )
+        assert result["summary"]["succeeded"] == 1
+        assert result["summary"]["failed"]    == 1
+        assert result["assets"][1]["success"] is True

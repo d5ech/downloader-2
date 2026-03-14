@@ -58,6 +58,17 @@ from backend.api import (
 client = TestClient(app, raise_server_exceptions=False)
 
 
+@pytest.fixture(autouse=True)
+def reset_rate_limiter():
+    """Reset the in-memory rate-limit counters before every test."""
+    from backend.api import limiter
+    try:
+        limiter._storage.reset()
+    except Exception:
+        pass
+    yield
+
+
 # ===========================================================================
 # Helpers
 # ===========================================================================
@@ -501,3 +512,93 @@ class TestDownloadRequestValidator:
     def test_non_numeric_id_raises(self):
         with pytest.raises(Exception):
             self._make("https://www.facebook.com/ads/library/?id=abc")
+
+
+# ===========================================================================
+# Structured ErrorResponse shape
+# ===========================================================================
+
+class TestErrorResponseShape:
+    """
+    All error paths must return {"error": str, "detail": ..., "job_id": ...}.
+
+    This suite ensures the new ErrorResponse schema is always present,
+    regardless of which exception handler handled the response.
+    """
+
+    def test_422_has_error_field(self):
+        r = client.post("/download", json={"url": "not-a-valid-url"})
+        assert r.status_code == 422
+        body = r.json()
+        assert "error" in body, f"missing 'error' field: {body}"
+
+    def test_422_error_is_validation_error(self):
+        r = client.post("/download", json={"url": "not-a-valid-url"})
+        assert r.json()["error"] == "validation_error"
+
+    def test_422_has_detail_field(self):
+        r = client.post("/download", json={"url": "not-a-valid-url"})
+        assert "detail" in r.json()
+
+    def test_422_detail_is_string(self):
+        r = client.post("/download", json={"url": "not-a-valid-url"})
+        assert isinstance(r.json()["detail"], str)
+
+    def test_422_missing_field_has_error(self):
+        r = client.post("/download", json={})
+        assert r.json().get("error") == "validation_error"
+
+    def test_404_has_error_field(self):
+        with patch(
+            "backend.api._fetch_job",
+            side_effect=__import__("fastapi").HTTPException(status_code=404, detail="not found"),
+        ):
+            r = client.get("/status/nonexistent-id")
+        assert r.status_code == 404
+        assert "error" in r.json()
+
+    def test_404_error_is_not_found(self):
+        with patch(
+            "backend.api._fetch_job",
+            side_effect=__import__("fastapi").HTTPException(status_code=404, detail="not found"),
+        ):
+            r = client.get("/status/nonexistent-id")
+        assert r.json()["error"] == "not_found"
+
+    def test_500_result_has_error_field(self):
+        job = _mock_job(rq_status="failed", exc_info="boom")
+        with _patch_fetch(job):
+            r = client.get(f"/result/{JOB_ID}")
+        assert r.status_code == 500
+        assert "error" in r.json()
+
+    def test_500_error_is_internal_error(self):
+        job = _mock_job(rq_status="failed", exc_info="boom")
+        with _patch_fetch(job):
+            r = client.get(f"/result/{JOB_ID}")
+        assert r.json()["error"] == "internal_error"
+
+    def test_202_pending_has_error_field(self):
+        """GET /result while job is still queued returns 202 with structured body."""
+        job = _mock_job(rq_status="queued")
+        with _patch_fetch(job):
+            r = client.get(f"/result/{JOB_ID}")
+        assert r.status_code == 202
+        assert "error" in r.json()
+
+    def test_202_pending_error_is_job_pending(self):
+        job = _mock_job(rq_status="queued")
+        with _patch_fetch(job):
+            r = client.get(f"/result/{JOB_ID}")
+        assert r.json()["error"] == "job_pending"
+
+    def test_error_response_has_job_id_key(self):
+        """The job_id key should always be present (None when not applicable)."""
+        r = client.post("/download", json={"url": "bad"})
+        assert "job_id" in r.json()
+
+    def test_200_responses_do_not_have_error_field(self):
+        """Successful responses must NOT include the error envelope."""
+        r = client.get("/health")
+        assert r.status_code == 200
+        assert "error" not in r.json()
