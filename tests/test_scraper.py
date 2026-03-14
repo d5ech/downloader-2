@@ -8,6 +8,10 @@ not require a real browser:
   - _extract_media_urls  (drives _recursive_search)
   - _extract_ad_id_from_url
   - scrape_ad_library_url (shim) — exercised via a monkey-patched scrape_ad_url
+  - _trigger_video_playback
+  - _try_click_play_button
+  - _try_click_video_element
+  - _try_js_play
 
 Playwright / network I/O is NOT exercised here; that belongs to integration
 tests that run against a live browser.
@@ -34,6 +38,11 @@ from backend.scraper import (
     _parse_and_collect,
     scrape_ad_library_url,
     _recursive_search,
+    _trigger_video_playback,
+    _try_click_play_button,
+    _try_click_video_element,
+    _try_js_play,
+    PLAYBACK_TIMEOUT_MS,
 )
 
 
@@ -438,3 +447,341 @@ class TestScrapeAdLibraryUrlShim:
             "https://www.facebook.com/ads/library/?id=1"
         )
         assert records[0].assets == []
+
+
+# ===========================================================================
+# Playback-trigger helpers — mock Page
+# ===========================================================================
+
+class MockPage:
+    """
+    Minimal stand-in for a Playwright Page used by playback-trigger unit tests.
+
+    Attributes
+    ----------
+    click_raises :
+        If set, ``click()`` raises this exception instead of succeeding.
+    click_calls :
+        Accumulates every (selector, kwargs) call made to ``click()``.
+    evaluate_return :
+        Value returned by ``evaluate()``.
+    evaluate_calls :
+        Accumulates every JS expression passed to ``evaluate()``.
+    wait_for_load_state_raises :
+        If set, ``wait_for_load_state`` raises this exception (simulates timeout).
+    wait_calls :
+        Accumulates every call made to ``wait_for_load_state``.
+    """
+
+    def __init__(
+        self,
+        *,
+        click_raises: Exception | None = None,
+        evaluate_return: bool = True,
+        wait_for_load_state_raises: Exception | None = None,
+    ):
+        self.click_raises = click_raises
+        self.click_calls: list[tuple] = []
+        self.evaluate_return = evaluate_return
+        self.evaluate_calls: list[str] = []
+        self.wait_for_load_state_raises = wait_for_load_state_raises
+        self.wait_calls: list[tuple] = []
+
+    def click(self, selector: str, **kwargs):
+        self.click_calls.append((selector, kwargs))
+        if self.click_raises:
+            raise self.click_raises
+
+    def evaluate(self, expression: str, **kwargs):
+        self.evaluate_calls.append(expression)
+        return self.evaluate_return
+
+    def wait_for_load_state(self, state: str, **kwargs):
+        self.wait_calls.append((state, kwargs))
+        if self.wait_for_load_state_raises:
+            raise self.wait_for_load_state_raises
+
+
+# ---------------------------------------------------------------------------
+# _try_click_play_button
+# ---------------------------------------------------------------------------
+
+class TestTryClickPlayButton:
+    def test_returns_true_on_first_successful_click(self):
+        page = MockPage()
+        assert _try_click_play_button(page) is True
+
+    def test_only_one_click_on_immediate_success(self):
+        page = MockPage()
+        _try_click_play_button(page)
+        assert len(page.click_calls) == 1
+
+    def test_returns_false_when_all_selectors_fail(self):
+        page = MockPage(click_raises=Exception("not found"))
+        assert _try_click_play_button(page) is False
+
+    def test_tries_all_selectors_before_giving_up(self):
+        page = MockPage(click_raises=Exception("not found"))
+        _try_click_play_button(page)
+        # Should have tried every selector in the list (≥ 4)
+        assert len(page.click_calls) >= 4
+
+    def test_stops_at_first_success(self):
+        attempts = []
+
+        class PartialPage(MockPage):
+            def click(self, selector, **kwargs):
+                attempts.append(selector)
+                # Fail on the first selector, succeed on the second
+                if len(attempts) < 2:
+                    raise Exception("not found")
+
+        _try_click_play_button(PartialPage())
+        assert len(attempts) == 2
+
+    def test_click_called_with_timeout_kwarg(self):
+        page = MockPage()
+        _try_click_play_button(page)
+        _, kwargs = page.click_calls[0]
+        assert "timeout" in kwargs
+
+
+# ---------------------------------------------------------------------------
+# _try_click_video_element
+# ---------------------------------------------------------------------------
+
+class TestTryClickVideoElement:
+    def test_returns_true_when_video_exists(self):
+        page = MockPage()
+        assert _try_click_video_element(page) is True
+
+    def test_clicks_video_selector(self):
+        page = MockPage()
+        _try_click_video_element(page)
+        selector, _ = page.click_calls[0]
+        assert selector == "video"
+
+    def test_returns_false_when_no_video(self):
+        page = MockPage(click_raises=Exception("No element"))
+        assert _try_click_video_element(page) is False
+
+    def test_click_called_with_timeout_kwarg(self):
+        page = MockPage()
+        _try_click_video_element(page)
+        _, kwargs = page.click_calls[0]
+        assert "timeout" in kwargs
+
+    def test_no_extra_clicks_made(self):
+        page = MockPage()
+        _try_click_video_element(page)
+        assert len(page.click_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# _try_js_play
+# ---------------------------------------------------------------------------
+
+class TestTryJsPlay:
+    def test_returns_true_when_video_found(self):
+        page = MockPage(evaluate_return=True)
+        assert _try_js_play(page) is True
+
+    def test_returns_false_when_no_video(self):
+        page = MockPage(evaluate_return=False)
+        assert _try_js_play(page) is False
+
+    def test_evaluate_called_once(self):
+        page = MockPage()
+        _try_js_play(page)
+        assert len(page.evaluate_calls) == 1
+
+    def test_js_expression_targets_video(self):
+        page = MockPage()
+        _try_js_play(page)
+        expr = page.evaluate_calls[0]
+        assert "video" in expr.lower()
+
+    def test_js_expression_calls_play(self):
+        page = MockPage()
+        _try_js_play(page)
+        assert "play()" in page.evaluate_calls[0]
+
+    def test_js_expression_dispatches_click_event(self):
+        page = MockPage()
+        _try_js_play(page)
+        assert "dispatchEvent" in page.evaluate_calls[0]
+
+    def test_falsy_evaluate_result_returns_false(self):
+        page = MockPage(evaluate_return=None)  # type: ignore[arg-type]
+        assert _try_js_play(page) is False
+
+
+# ---------------------------------------------------------------------------
+# _trigger_video_playback
+# ---------------------------------------------------------------------------
+
+class TestTriggerVideoPlayback:
+    """Tests for the orchestrator that ties the three strategies together."""
+
+    def _make(self, existing_videos: list[str] | None = None) -> tuple[MediaResult, threading.Lock]:
+        r = MediaResult(videos=list(existing_videos or []))
+        return r, threading.Lock()
+
+    # ── No video element present ──────────────────────────────────────────
+
+    def test_returns_empty_when_no_interaction_succeeds(self):
+        page = MockPage(click_raises=Exception("no element"), evaluate_return=False)
+        result, lock = self._make()
+        new = _trigger_video_playback(page, result, lock)
+        assert new == []
+
+    def test_does_not_mutate_result_when_no_element(self):
+        page = MockPage(click_raises=Exception("no element"), evaluate_return=False)
+        result, lock = self._make()
+        _trigger_video_playback(page, result, lock)
+        assert result.videos == []
+
+    # ── Video element found, no new URLs emitted ──────────────────────────
+
+    def test_returns_empty_when_no_new_urls_after_click(self):
+        page = MockPage()   # click succeeds; wait_for_load_state does nothing
+        result, lock = self._make()
+        new = _trigger_video_playback(page, result, lock)
+        assert new == []
+
+    def test_wait_called_after_successful_interaction(self):
+        page = MockPage()
+        result, lock = self._make()
+        _trigger_video_playback(page, result, lock)
+        assert len(page.wait_calls) == 1
+
+    def test_wait_uses_playback_timeout(self):
+        page = MockPage()
+        result, lock = self._make()
+        _trigger_video_playback(page, result, lock)
+        _, kwargs = page.wait_calls[0]
+        assert kwargs.get("timeout") == PLAYBACK_TIMEOUT_MS
+
+    def test_wait_requests_networkidle(self):
+        page = MockPage()
+        result, lock = self._make()
+        _trigger_video_playback(page, result, lock)
+        state, _ = page.wait_calls[0]
+        assert state == "networkidle"
+
+    # ── New URLs discovered after playback ────────────────────────────────
+
+    def test_returns_only_new_videos(self):
+        """Simulate the response handler appending a URL during wait."""
+
+        class AppendingPage(MockPage):
+            def __init__(self, result_ref, lock_ref):
+                super().__init__()
+                self._result = result_ref
+                self._lock = lock_ref
+
+            def wait_for_load_state(self, state, **kwargs):
+                super().wait_for_load_state(state, **kwargs)
+                # Simulate a GraphQL response arriving during the wait
+                with self._lock:
+                    self._result.videos.append("https://cdn.fb.com/lazy.mp4")
+
+        result, lock = self._make()
+        page = AppendingPage(result, lock)
+        new = _trigger_video_playback(page, result, lock)
+        assert new == ["https://cdn.fb.com/lazy.mp4"]
+
+    def test_existing_videos_not_included_in_return(self):
+        """Pre-existing video URLs must not appear in the returned list."""
+
+        class AppendingPage(MockPage):
+            def __init__(self, result_ref, lock_ref):
+                super().__init__()
+                self._result = result_ref
+                self._lock = lock_ref
+
+            def wait_for_load_state(self, state, **kwargs):
+                super().wait_for_load_state(state, **kwargs)
+                with self._lock:
+                    self._result.videos.append("https://cdn.fb.com/new.mp4")
+
+        result, lock = self._make(existing_videos=["https://cdn.fb.com/old.mp4"])
+        page = AppendingPage(result, lock)
+        new = _trigger_video_playback(page, result, lock)
+        assert "https://cdn.fb.com/old.mp4" not in new
+        assert "https://cdn.fb.com/new.mp4" in new
+
+    def test_multiple_new_urls_all_returned(self):
+        class AppendingPage(MockPage):
+            def __init__(self, result_ref, lock_ref):
+                super().__init__()
+                self._result = result_ref
+                self._lock = lock_ref
+
+            def wait_for_load_state(self, state, **kwargs):
+                super().wait_for_load_state(state, **kwargs)
+                with self._lock:
+                    self._result.videos.extend([
+                        "https://cdn.fb.com/a.mp4",
+                        "https://cdn.fb.com/b.mp4",
+                    ])
+
+        result, lock = self._make()
+        page = AppendingPage(result, lock)
+        new = _trigger_video_playback(page, result, lock)
+        assert set(new) == {"https://cdn.fb.com/a.mp4", "https://cdn.fb.com/b.mp4"}
+
+    # ── Timeout resilience ────────────────────────────────────────────────
+
+    def test_timeout_during_wait_does_not_raise(self):
+        page = MockPage(wait_for_load_state_raises=Exception("Timeout 3000ms exceeded"))
+        result, lock = self._make()
+        # Must not propagate the exception
+        new = _trigger_video_playback(page, result, lock)
+        assert isinstance(new, list)
+
+    def test_returns_urls_collected_before_timeout(self):
+        """URLs added to result before the timeout fires must still be returned."""
+
+        class TimeoutPage(MockPage):
+            def __init__(self, result_ref, lock_ref):
+                super().__init__(
+                    wait_for_load_state_raises=Exception("Timeout 3000ms exceeded")
+                )
+                self._result = result_ref
+                self._lock = lock_ref
+
+            def wait_for_load_state(self, state, **kwargs):
+                # Append URL before raising timeout
+                with self._lock:
+                    self._result.videos.append("https://cdn.fb.com/partial.mp4")
+                super().wait_for_load_state(state, **kwargs)
+
+        result, lock = self._make()
+        page = TimeoutPage(result, lock)
+        new = _trigger_video_playback(page, result, lock)
+        assert "https://cdn.fb.com/partial.mp4" in new
+
+    # ── Strategy priority ─────────────────────────────────────────────────
+
+    def test_play_button_tried_before_video_element(self):
+        """If the play button click succeeds, video element should not be tried."""
+        page = MockPage()   # click always succeeds
+        result, lock = self._make()
+        _trigger_video_playback(page, result, lock)
+        selectors_tried = [s for s, _ in page.click_calls]
+        # Should have stopped after one click (the play button)
+        assert len(selectors_tried) == 1
+
+    def test_js_play_used_when_all_clicks_fail(self):
+        page = MockPage(click_raises=Exception("no element"), evaluate_return=True)
+        result, lock = self._make()
+        _trigger_video_playback(page, result, lock)
+        assert len(page.evaluate_calls) == 1
+
+    def test_no_wait_when_no_interaction_succeeds(self):
+        """wait_for_load_state must NOT be called if nothing was clicked."""
+        page = MockPage(click_raises=Exception("no element"), evaluate_return=False)
+        result, lock = self._make()
+        _trigger_video_playback(page, result, lock)
+        assert page.wait_calls == []

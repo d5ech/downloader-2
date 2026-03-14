@@ -42,9 +42,10 @@ logger = get_logger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-GRAPHQL_ENDPOINT = "https://www.facebook.com/api/graphql/"
-PAGE_TIMEOUT_MS  = 10_000   # hard cap: 10 s
-NAV_TIMEOUT_MS   = 10_000
+GRAPHQL_ENDPOINT    = "https://www.facebook.com/api/graphql/"
+PAGE_TIMEOUT_MS     = 10_000   # hard cap: 10 s
+NAV_TIMEOUT_MS      = 10_000
+PLAYBACK_TIMEOUT_MS = 3_000    # wait for lazy-loaded video URLs after click
 
 # Keys whose *values* are treated as media URLs.
 # The search is case-sensitive to match Facebook's exact field names.
@@ -235,6 +236,14 @@ def _collect_media(page: Page, url: str, result: MediaResult) -> None:
     except Exception:
         pass  # networkidle timeout is acceptable; we keep what we have
 
+    # --- Playback fallback -------------------------------------------
+    # Some ads keep video URLs behind a lazy-load gate: the URL is only
+    # emitted in a GraphQL response *after* the user presses play.
+    # If the initial page load produced no videos, simulate playback.
+    if not result.videos:
+        logger.info("No videos after page load — attempting playback trigger")
+        _trigger_video_playback(page, result, lock)
+
 
 def _dismiss_cookie_banner_on_load(page: Page) -> None:
     """Register a handler to click the cookie-consent button if it appears."""
@@ -245,6 +254,146 @@ def _dismiss_cookie_banner_on_load(page: Page) -> None:
             pass
 
     page.on("domcontentloaded", _handler)
+
+
+# ---------------------------------------------------------------------------
+# Playback-triggered extraction
+# ---------------------------------------------------------------------------
+
+
+def _trigger_video_playback(
+    page: "Page",
+    result: MediaResult,
+    lock: threading.Lock,
+) -> list[str]:
+    """
+    Simulate a user pressing play so Facebook emits lazy-loaded video URLs.
+
+    Facebook sometimes withholds the actual ``playable_url`` / ``video_hd_url``
+    until after the first playback interaction.  This function:
+
+    1. Takes a snapshot of ``result.videos`` before interacting.
+    2. Tries three interaction strategies in priority order (stopping at the
+       first that succeeds):
+
+       a. Click an overlay play button identified by ``aria-label`` or role.
+       b. Click the ``<video>`` element directly.
+       c. Dispatch a synthetic ``click`` event and call ``.play()`` via JS.
+
+    3. Waits up to ``PLAYBACK_TIMEOUT_MS`` (3 s) for ``networkidle`` so the
+       response handler already registered on the page can capture any new
+       GraphQL responses.
+    4. Returns only the video URLs that were **not** present before this call.
+
+    Args:
+        page:   Playwright ``Page`` already navigated to the ad URL.
+        result: Shared :class:`MediaResult`; updated in-place by the existing
+                response handler as new responses arrive.
+        lock:   Mutex guarding mutations to *result*.
+
+    Returns:
+        List of video URL strings newly discovered by the playback trigger.
+        Empty list if no ``<video>`` element was found or no new URLs appeared.
+    """
+    # Snapshot so we can diff afterwards
+    with lock:
+        videos_before: list[str] = list(result.videos)
+
+    played = (
+        _try_click_play_button(page)
+        or _try_click_video_element(page)
+        or _try_js_play(page)
+    )
+
+    if not played:
+        logger.debug("No video element or play button found — skipping playback trigger")
+        return []
+
+    # Wait for lazy GraphQL responses the playback interaction may trigger
+    try:
+        page.wait_for_load_state("networkidle", timeout=PLAYBACK_TIMEOUT_MS)
+    except Exception:
+        pass  # 3 s timeout is expected; collect whatever arrived
+
+    with lock:
+        new_videos = [v for v in result.videos if v not in videos_before]
+
+    if new_videos:
+        logger.info("Playback trigger discovered %d new video URL(s)", len(new_videos))
+    else:
+        logger.debug("Playback trigger yielded no new video URLs")
+
+    return new_videos
+
+
+def _try_click_play_button(page: "Page") -> bool:
+    """
+    Click an overlay play-button element using common Facebook selectors.
+
+    Tries each selector with a 1 s timeout and returns ``True`` as soon as
+    one click succeeds.  Returns ``False`` if none of the selectors matched.
+    """
+    selectors = [
+        '[aria-label="Play"]',
+        '[aria-label="play"]',
+        '[aria-label*="Play" i]',
+        '[role="button"][data-video-id]',
+        # Muted-autoplay carousel play button
+        'div[data-pagelet*="Video"] [role="button"]',
+    ]
+    for selector in selectors:
+        try:
+            page.click(selector, timeout=1_000)
+            logger.debug("Clicked play button via selector: %s", selector)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _try_click_video_element(page: "Page") -> bool:
+    """
+    Click the first ``<video>`` element found in the DOM.
+
+    Returns ``True`` if a ``<video>`` element was present and the click was
+    dispatched, ``False`` otherwise.
+    """
+    try:
+        page.click("video", timeout=1_000)
+        logger.debug("Clicked <video> element directly")
+        return True
+    except Exception:
+        return False
+
+
+def _try_js_play(page: "Page") -> bool:
+    """
+    Dispatch a synthetic ``MouseEvent`` and call ``.play()`` on the first
+    ``<video>`` element via JavaScript.
+
+    This bypasses Playwright's element visibility checks and is the last
+    resort for videos rendered off-screen or hidden by overlays.
+
+    Returns ``True`` if a ``<video>`` element was found in the DOM (regardless
+    of whether the browser permitted autoplay), ``False`` if no element exists.
+    """
+    found: bool = page.evaluate(
+        """() => {
+            const video = document.querySelector('video');
+            if (!video) return false;
+            video.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
+            const promise = video.play();
+            if (promise && typeof promise.catch === 'function') {
+                // Suppress NotAllowedError thrown in headless when autoplay
+                // is blocked — the click event above is still useful.
+                promise.catch(() => {});
+            }
+            return true;
+        }"""
+    )
+    if found:
+        logger.debug("JS play() dispatched on <video>")
+    return bool(found)
 
 
 # ---------------------------------------------------------------------------
