@@ -18,5 +18,8 @@ requests==2.32.3
 redis==5.0.6
 rq==1.16.2
 
+# Rate limiting
+slowapi==0.1.9
+
 # Utilities
 python-dotenv==1.0.1

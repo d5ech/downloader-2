@@ -3,30 +3,108 @@ api.py — FastAPI server for the Facebook Ad Library Creative Downloader.
 
 Endpoints
 ---------
-POST   /download            Enqueue a scrape + download job
+POST   /download            Enqueue a scrape + download job  (5 req/min per IP)
 GET    /status/{job_id}     Poll job status
 GET    /result/{job_id}     Retrieve downloaded filenames when complete
-
+GET    /files/{job_id}/{filename}  Serve a downloaded file
 GET    /health              Liveness probe
+
+Production features
+-------------------
+* Rate limiting  — 5 POST /download requests per minute per IP (Redis-backed).
+* Access logging — every request logged with method, path, status, latency, IP.
+* Job cleanup    — background task deletes /tmp/jobs/* dirs older than 30 min.
+* Structured errors — all error responses share a single JSON schema.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import shutil
+import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, field_validator
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 try:
-    from backend.utils import get_redis_connection, get_logger, AdUrlError, parse_ad_url
+    from backend.utils import get_redis_connection, get_logger, AdUrlError, parse_ad_url, REDIS_URL
 except ImportError:
-    from utils import get_redis_connection, get_logger, AdUrlError, parse_ad_url  # type: ignore[no-redef]
+    from utils import get_redis_connection, get_logger, AdUrlError, parse_ad_url, REDIS_URL  # type: ignore[no-redef]
 
 logger = get_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# Rate limiter — Redis-backed so limits are shared across API replicas
+# ---------------------------------------------------------------------------
+
+limiter = Limiter(key_func=get_remote_address, storage_uri=REDIS_URL)
+
+# ---------------------------------------------------------------------------
+# Temporary job storage cleanup
+# ---------------------------------------------------------------------------
+
+JOBS_ROOT = Path("/tmp/jobs")
+JOB_TTL_SECONDS = 30 * 60   # 30 minutes
+_CLEANUP_INTERVAL = 5 * 60  # run every 5 minutes
+
+
+def _cleanup_expired_jobs() -> None:
+    """Remove job directories whose last-modified time exceeds JOB_TTL_SECONDS."""
+    if not JOBS_ROOT.exists():
+        return
+    cutoff = time.time() - JOB_TTL_SECONDS
+    removed = 0
+    for job_dir in JOBS_ROOT.iterdir():
+        if not job_dir.is_dir():
+            continue
+        try:
+            if job_dir.stat().st_mtime < cutoff:
+                shutil.rmtree(job_dir)
+                logger.info("Removed expired job dir: %s", job_dir.name)
+                removed += 1
+        except Exception as exc:
+            logger.warning("Could not remove job dir %s: %s", job_dir.name, exc)
+    if removed:
+        logger.info("Cleanup pass complete — removed %d expired job dir(s)", removed)
+
+
+async def _cleanup_loop() -> None:
+    """Periodic background coroutine: sleep then clean."""
+    while True:
+        await asyncio.sleep(_CLEANUP_INTERVAL)
+        try:
+            _cleanup_expired_jobs()
+        except Exception as exc:
+            logger.error("Cleanup loop error: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Application lifespan
+# ---------------------------------------------------------------------------
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(_cleanup_loop())
+    logger.info(
+        "Job cleanup task started (ttl=%ds, interval=%ds)",
+        JOB_TTL_SECONDS, _CLEANUP_INTERVAL,
+    )
+    yield
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
 
 # ---------------------------------------------------------------------------
 # Application
@@ -36,7 +114,10 @@ app = FastAPI(
     title="Facebook Ad Library Downloader",
     description="Submit Ad Library URLs and download creative assets.",
     version="1.0.0",
+    lifespan=lifespan,
 )
+
+app.state.limiter = limiter
 
 app.add_middleware(
     CORSMiddleware,
@@ -45,6 +126,98 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---------------------------------------------------------------------------
+# Request / access logging middleware
+# ---------------------------------------------------------------------------
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start = time.time()
+    response = await call_next(request)
+    ms = (time.time() - start) * 1000
+    ip = request.client.host if request.client else "unknown"
+    logger.info(
+        "%s %s %d %.1fms ip=%s",
+        request.method, request.url.path, response.status_code, ms, ip,
+    )
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Structured error schema + helpers
+# ---------------------------------------------------------------------------
+
+
+class ErrorResponse(BaseModel):
+    """Uniform error envelope returned by all error responses."""
+    error: str              # machine-readable slug
+    detail: str | None = None
+    job_id: str | None = None
+
+
+def _json_error(
+    error: str,
+    detail: str | None = None,
+    job_id: str | None = None,
+    status: int = 400,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status,
+        content=ErrorResponse(error=error, detail=detail, job_id=job_id).model_dump(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Global exception handlers
+# ---------------------------------------------------------------------------
+
+
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
+    ip = request.client.host if request.client else "unknown"
+    logger.warning("Rate limit hit: ip=%s path=%s", ip, request.url.path)
+    retry_after = getattr(exc, "retry_after", None)
+    detail = (
+        f"5 requests per minute per IP. Retry-After: {retry_after}s"
+        if retry_after
+        else "5 requests per minute per IP."
+    )
+    return _json_error("rate_limit_exceeded", detail, status=429)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    msgs = "; ".join(
+        f"{'→'.join(str(loc) for loc in e['loc'])}: {e['msg']}"
+        for e in exc.errors()
+    )
+    logger.warning("Validation error: %s %s — %s", request.method, request.url.path, msgs)
+    return _json_error("validation_error", msgs, status=422)
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    _slugs = {
+        400: "bad_request",
+        202: "job_pending",
+        404: "not_found",
+        429: "rate_limit_exceeded",
+        500: "internal_error",
+    }
+    slug = _slugs.get(exc.status_code, "http_error")
+    return _json_error(slug, str(exc.detail) if exc.detail else None, status=exc.status_code)
+
+
+@app.exception_handler(Exception)
+async def generic_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    logger.error(
+        "Unhandled exception: %s %s — %s",
+        request.method, request.url.path, exc, exc_info=True,
+    )
+    return _json_error("internal_error", "An unexpected error occurred.", status=500)
+
 
 # ---------------------------------------------------------------------------
 # RQ status → API status mapping
@@ -85,7 +258,6 @@ class DownloadRequest(BaseModel):
         """Reject anything that is not a valid Facebook Ad Library URL or bare ID."""
         try:
             parsed = parse_ad_url(v)
-            # Normalise to the canonical URL so the worker always receives https://
             return parsed["url"]
         except AdUrlError as exc:
             raise ValueError(str(exc)) from exc
@@ -137,7 +309,6 @@ def _fetch_job(job_id: str):
     try:
         return Job.fetch(job_id, connection=get_redis_connection())
     except (NoSuchJobError, Exception) as exc:
-        # rq raises NoSuchJobError; older versions raise a plain Exception
         if "NoSuchJob" in type(exc).__name__ or "does not exist" in str(exc).lower():
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
@@ -147,8 +318,7 @@ def _files_from_result(job_result: dict | None) -> list[str]:
     """
     Extract the list of successfully downloaded filenames from a job result dict.
 
-    Only files whose ``success`` flag is truthy are included.  Returns an
-    empty list when *job_result* is ``None`` or contains no assets.
+    Only files whose ``success`` flag is truthy are included.
     """
     if not job_result or not isinstance(job_result, dict):
         return []
@@ -174,10 +344,8 @@ async def get_file(job_id: str, filename: str) -> FileResponse:
     Serve a single file from the job output directory.
 
     Files are stored at ``/tmp/jobs/{job_id}/{filename}`` by the worker.
-
     Raises **404** if the job directory or file does not exist.
     """
-    # Prevent path traversal: reject filenames containing separators or leading dot
     if "/" in filename or "\\" in filename or filename.startswith("."):
         raise HTTPException(status_code=400, detail="Invalid filename.")
 
@@ -201,19 +369,19 @@ async def health_check() -> dict:
     tags=["jobs"],
     summary="Enqueue a scrape + download job",
 )
-async def post_download(body: DownloadRequest) -> DownloadResponse:
+@limiter.limit("5/minute")
+async def post_download(request: Request, body: DownloadRequest) -> DownloadResponse:
     """
     Accept a Facebook Ad Library URL, enqueue a background job, and
     return a ``job_id`` that the client can poll.
 
-    The URL is validated and normalised to its canonical form before
-    being forwarded to the worker.
+    Rate-limited to **5 requests per minute per IP**.
 
     Returns **202 Accepted** immediately; the actual work is performed
     asynchronously by an RQ worker process.
     """
-    from rq.job import Retry  # noqa: PLC0415
-    from workers.tasks import (  # noqa: PLC0415
+    from rq.job import Retry
+    from workers.tasks import (
         on_failure_callback,
         on_success_callback,
         MAX_RETRIES,
@@ -230,14 +398,13 @@ async def post_download(body: DownloadRequest) -> DownloadResponse:
         job_timeout="10m",
         result_ttl=3_600,       # keep result in Redis for 1 hour
         failure_ttl=86_400,     # keep failure info for 24 hours
-        # Retry transient failures up to MAX_RETRIES times.
-        # on_failure_callback will zero retries_left for NonRetryableErrors.
         retry=Retry(max=MAX_RETRIES, interval=RETRY_INTERVALS),
         on_failure=on_failure_callback,
         on_success=on_success_callback,
     )
 
-    logger.info("Enqueued job %s for %s (retries=%d)", job.id, body.url, MAX_RETRIES)
+    ip = request.client.host if request.client else "unknown"
+    logger.info("Enqueued job %s url=%s ip=%s retries=%d", job.id, body.url, ip, MAX_RETRIES)
     return DownloadResponse(job_id=job.id, status="queued")
 
 
@@ -253,7 +420,7 @@ async def get_status(job_id: str) -> StatusResponse:
 
     Status values
     -------------
-    * ``queued``   — waiting in the queue (includes RQ's *deferred* state)
+    * ``queued``   — waiting in the queue
     * ``running``  — a worker is actively processing the job
     * ``complete`` — finished successfully; results are available
     * ``error``    — failed, stopped, or cancelled
@@ -296,8 +463,9 @@ async def get_result(job_id: str) -> ResultResponse:
 
     if api_status == "error":
         error_detail = str(job.exc_info).strip() if job.exc_info else "Job failed."
+        logger.error("Job %s result requested in error state: %s", job_id, error_detail)
         raise HTTPException(status_code=500, detail=error_detail)
 
-    # api_status == "complete"
     files = _files_from_result(job.result)
+    logger.info("Job %s result served — %d file(s)", job_id, len(files))
     return ResultResponse(job_id=job_id, status=api_status, files=files)

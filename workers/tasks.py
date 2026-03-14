@@ -341,6 +341,7 @@ def run_ad_download(
             }
     """
     conn = get_redis_connection()
+    started_at = time.monotonic()
     logger.info("[job:%s] Pipeline starting | url=%s", job_id, url)
 
     try:
@@ -369,22 +370,29 @@ def run_ad_download(
 
         # ── Step 6: mark complete ───────────────────────────────────────────
         _set_phase(conn, job_id, "complete")
+        elapsed = time.monotonic() - started_at
         logger.info(
-            "[job:%s] Pipeline finished — %d/%d files downloaded",
+            "[job:%s] Pipeline finished — %d/%d files downloaded in %.1fs",
             job_id,
             result["summary"]["succeeded"],
             result["summary"]["total"],
+            elapsed,
         )
         return result
 
-    except (NonRetryableError, ScraperError, DownloadError):
+    except (NonRetryableError, ScraperError, DownloadError) as exc:
+        elapsed = time.monotonic() - started_at
+        logger.error(
+            "[job:%s] Pipeline aborted after %.1fs — %s: %s",
+            job_id, elapsed, type(exc).__name__, exc,
+        )
         raise   # let on_failure_callback handle phase + retry decisions
 
     except Exception as exc:
-        # Unexpected error — treat as transient so RQ will retry
+        elapsed = time.monotonic() - started_at
         _set_phase(conn, job_id, "error")
         logger.error(
-            "[job:%s] Unexpected error: %s\n%s",
-            job_id, exc, tb.format_exc(),
+            "[job:%s] Unexpected error after %.1fs: %s\n%s",
+            job_id, elapsed, exc, tb.format_exc(),
         )
         raise
