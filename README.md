@@ -44,13 +44,13 @@ cp .env.example .env
 # Edit .env as needed
 
 # 2. Start all services
-docker compose -f docker/docker-compose.yml up --build
+docker compose up --build
 
 # 3. Open the UI
 open http://localhost:3000
 
 # 4. (Optional) RQ Dashboard
-docker compose -f docker/docker-compose.yml --profile dev up
+docker compose --profile dev up
 open http://localhost:9181
 ```
 
@@ -87,21 +87,19 @@ npm run dev   # http://localhost:3000
 
 ## API Reference
 
-| Method | Endpoint                              | Description                        |
-|--------|---------------------------------------|------------------------------------|
-| GET    | `/health`                             | Liveness probe                     |
-| POST   | `/jobs`                               | Submit a new download job          |
-| GET    | `/jobs/{job_id}`                      | Poll job status                    |
-| GET    | `/jobs/{job_id}/assets`               | List downloaded asset metadata     |
-| GET    | `/jobs/{job_id}/assets/{filename}`    | Stream / download a single asset   |
-| DELETE | `/jobs/{job_id}`                      | Cancel a job                       |
+| Method | Endpoint                       | Description                             |
+|--------|---------------------------------|-----------------------------------------|
+| GET    | `/health`                       | Liveness probe                          |
+| POST   | `/download`                     | Enqueue a scrape + download job (5/min per IP) |
+| GET    | `/status/{job_id}`              | Poll job status                         |
+| GET    | `/result/{job_id}`              | Get the list of downloaded filenames    |
+| GET    | `/files/{job_id}/{filename}`    | Download a single produced file         |
 
-### POST `/jobs` payload
+### POST `/download` payload
 
 ```json
 {
-  "url": "https://www.facebook.com/ads/library/?...",
-  "max_assets": 20
+  "url": "https://www.facebook.com/ads/library/?id=123456789"
 }
 ```
 
@@ -124,10 +122,8 @@ npm run dev   # http://localhost:3000
 │       └── lib/        # API client (axios)
 ├── docker/
 │   ├── Dockerfile          # Python (API + Worker)
-│   ├── Dockerfile.frontend # Next.js
-│   └── docker-compose.yml
-├── media/
-│   └── downloads/      # Downloaded assets (gitignored)
+│   └── Dockerfile.frontend # Next.js
+├── docker-compose.yml
 ├── requirements.txt
 ├── .env.example
 └── README.md
@@ -137,17 +133,14 @@ npm run dev   # http://localhost:3000
 
 ```bash
 # Run 3 parallel workers
-docker compose -f docker/docker-compose.yml up --scale worker=3
+docker compose up --scale worker=3
 ```
 
 ## TODO / Next Steps
 
-- [ ] Implement real DOM selectors in `scraper.py` (`_scrape_search_results`, `_scrape_single_ad`)
 - [ ] Add authentication / API key middleware to FastAPI
 - [ ] Implement ZIP bundling for bulk downloads
 - [ ] Add webhook support for job completion notifications
-- [ ] Write unit tests for scraper and downloader modules
-- [ ] Add rate limiting to the API
 
 ## Legal Notice
 
